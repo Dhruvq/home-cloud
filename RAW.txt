@@ -977,3 +977,216 @@ Important distinctions to remember:
 type = "batch" is for one-shot tasks like this test. The task goes dead when it completes successfully.
 type = "service" is what you will use for long-running workloads like inference servers. Those stay running.
 Never use device_requests inside the Docker config block — that is a raw Docker API field that Nomad ignores entirely. Always use the device stanza inside resources.
+
+
+Couple of things to finish the setup:
+VMs are not set to autostart in Proxmox
+Your doc sets BIOS to restore power, but that only boots the Proxmox host. The Ubuntu VMs inside won't start automatically unless you configure this in Proxmox for each VM:
+bash# On each Proxmox host, for each VM (replace 100 with your VM ID)
+qm set 100 --onboot 1
+
+# Verify
+qm config 100 | grep onboot
+# Should return: onboot: 1
+Without this, a power outage brings Proxmox back up but all your VMs sit there powered off, and nothing runs.
+Single Nomad server is a silent cluster killer
+Node1 is your only Nomad server. If it goes offline — power, crash, VM issue — Nodes 2 and 3 go leaderless. Running jobs continue briefly but no new scheduling happens, and service jobs won't restart if they crash. You have three nodes so you can fix this properly:
+hcl# On Node2 and Node3, add server block to nomad.hcl
+server {
+  enabled          = true
+  bootstrap_expect = 3  # Change Node1's bootstrap_expect to 3 as well
+}
+Then restart Nomad on all three nodes. Now you can lose any one node and the cluster keeps working. This is the single most important change before running real workloads.
+
+Part 3: README: How to use
+
+Restart policy on jobs
+Current Nomad config has no restart or reschedule behavior defined. A crashed service job will stay dead. Add this to every service job you deploy:
+group "your-group" {
+  restart {
+    attempts = 5
+    interval = "5m"
+    delay    = "15s"
+    mode     = "delay"   # keep retrying, don't give up
+  }
+
+  reschedule {
+    delay          = "30s"
+    delay_function = "exponential"
+    max_delay      = "10m"
+    unlimited      = true   # keep trying to place on another node if current node dies
+  }
+
+  task "your-task" { ... }
+}
+Example Usage:
+job "my-awesome-app" {
+  datacenters = ["dc1"]
+  type        = "service"
+
+  group "web-nodes" {
+    count = 3
+
+    # --- ADD THESE HERE ---
+    restart {
+      attempts = 5
+      interval = "5m"
+      delay    = "15s"
+      mode     = "delay"
+    }
+
+    reschedule {
+      delay          = "30s"
+      delay_function = "exponential"
+      max_delay      = "10m"
+      unlimited      = true
+    }
+    # ----------------------
+
+    task "server" {
+      driver = "docker"
+      config {
+        image = "nginx:latest"
+      }
+    }
+  }
+}
+Persistent storage
+Add this to every service job
+Just like the restart/reschedule policies, this goes inside your Job file (the .nomad file for your specific app), specifically within the config block of your task.
+2. Prepare the Nodes (Crucial Step) [example apollo]
+Before you run a job with a volume, the folder must exist on the physical machine. Since Nomad could schedule your job on any of your three nodes, you should create the directory on all of them:
+Run this on Node 1, Node 2, and Node 3:
+bash
+sudo mkdir -p /opt/nomad/volumes/apollo
+# Give Nomad/Docker permission to write to it
+sudo chmod -R 777 /opt/nomad/volumes/apollo 
+
+3. Add to your Job File
+When you're ready to deploy your app (like Apollo-AI), your task block will look like this:
+hcl
+task "apollo-task" {
+  driver = "docker"
+
+  config {
+    image = "100.NODE1_IP:5000/apollo-ai:latest"
+    
+    volumes = [
+      # host_path : container_path
+      "/opt/nomad/volumes/apollo:/app/data"
+    ]
+  }
+}
+
+4. The "Catch" with local volumes
+Since you have a 3-node cluster now, there is one thing to keep in mind: Local volumes don't travel.
+If your job runs on Node 2 and saves data to /opt/nomad/volumes/apollo, that data is physically on Node 2's hard drive.
+If Node 2 crashes and Nomad moves the job to Node 3, the app will look in /opt/nomad/volumes/apollo on Node 3 and find... nothing (it's a fresh, empty folder).
+How to handle this: Use constraints to force the job to always run on the same node where the data lives.
+
+GTX 1060 has only 3GB VRAM
+Add this to every service job
+Worth noting explicitly: Node2's GTX 1060 3GB will fail silently for most AI inference workloads. Most models need at least 4-8GB. Use constraints in GPU jobs so they don't accidentally land there:
+hcldevice "nvidia/gpu" {
+  count = 1
+  constraint {
+    attribute = "${device.attr.memory}"
+    operator  = ">="
+    value     = "4 GiB"
+  }
+}
+This ensures GPU jobs only land on Node1 (RTX 3050 Mobile) or Node3 (RTX 3080).
+
+No health checks defined
+Nomad can't tell if your service is actually working vs just running. Add this to every service job:
+hclservice {
+  name = "apollo-bot"
+
+  check {
+    type     = "script"
+    command  = "/bin/sh"
+    args     = ["-c", "pgrep -f your_process || exit 2"]
+    interval = "30s"
+    timeout  = "5s"
+  }
+}
+For HTTP services use type = "http" with a /health endpoint instead.
+
+Docker registry
+A private Docker registry runs as a permanent Nomad service job on gpu-node-1. It is the bridge between writing code on your Mac and running it on the cluster — without it, Nomad can only pull public images. With it, you can build your own project images locally and deploy them to any node.
+1. Create Persistent Storage for Registry Images
+Images pushed to the registry must survive container restarts. Create a directory on Node 1 to store them:
+bashsudo mkdir -p /opt/registry/data
+sudo chown -R 1000:1000 /opt/registry/data
+2. Deploy the Registry Job
+Create registry.nomad:
+hcljob "registry" {
+  datacenters = ["dc1"]
+  type        = "service"
+
+  group "registry" {
+    constraint {
+      attribute = "${node.unique.id}"
+      value     = "5bcd9b82-365b-aebd-538a-b54c5035967f"  # gpu-node-1
+    }
+
+    network {
+      port "registry" {
+        static = 5000
+        to     = 5000
+      }
+    }
+
+    task "registry" {
+      driver = "docker"
+
+      config {
+        image = "registry:2"
+        ports = ["registry"]
+        volumes = [
+          "/opt/registry/data:/var/lib/registry"
+        ]
+      }
+
+      resources {
+        cpu    = 200
+        memory = 256
+      }
+    }
+  }
+}
+bashnomad job run registry.nomad
+3. Configure Docker to Trust the Registry (Mac + All Nodes)
+Docker requires HTTPS by default. Since this registry runs over the Tailscale VPN without SSL, it must be explicitly trusted everywhere.
+On your Mac: open Docker Desktop → Settings → Docker Engine and add:
+json{
+  "insecure-registries": ["100.NODE1_IP:5000"]
+}
+Click Apply & Restart.
+On each Ubuntu node (Node 1, 2, and 3):
+bashsudo nano /etc/docker/daemon.json
+Add the same content, then restart Docker:
+bashsudo systemctl restart docker
+4. Verify It Works
+bash# From your Mac — should return {}
+curl http://100.NODE1_IP:5000/v2/
+
+# Test push
+docker pull alpine:latest
+docker tag alpine:latest 100.NODE1_IP:5000/alpine:latest
+docker push 100.NODE1_IP:5000/alpine:latest
+
+# Confirm it's stored
+curl http://100.NODE1_IP:5000/v2/_catalog
+# Expected: {"repositories":["alpine"]}
+5. How to Use It for Your Own Projects
+bash# On your Mac, inside any project folder
+docker build -t 100.NODE1_IP:5000/your-project:latest .
+docker push 100.NODE1_IP:5000/your-project:latest
+Then reference that image in your .nomad job file:
+hclconfig {
+  image = "100.NODE1_IP:5000/your-project:latest"
+}
+Nomad will pull it automatically on whichever node the job lands on.
+
+Note on the network_interface fix: The registry initially bound to 127.0.0.1:5000 (loopback only) because Nomad didn't know which network interface to use. The fix was adding network_interface = "tailscale0" to the client block in /etc/nomad.d/nomad.hcl on all three nodes. This must be done on any new node added to the cluster.
