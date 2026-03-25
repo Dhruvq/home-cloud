@@ -20,8 +20,14 @@ A detailed technical log of building a self-hosted home cloud cluster using thre
 12. [Phase 6 — Node 3: Deployment](#phase-6--node-3-deployment)
 13. [Phase 7 — Node 3: GPU Integration & Cluster Finalization](#phase-7--node-3-gpu-integration--cluster-finalization)
 14. [Part 2 — Workload Orchestration with Nomad](#part-2--workload-orchestration-with-nomad)
-15. [Current Cluster Architecture](#current-cluster-architecture)
-16. [Node Setup Checklist](#node-setup-checklist)
+15. [Part 3 — Advanced Configuration & Local Registry](#part-3--advanced-configuration--local-registry)
+    - [Proxmox Reliability: VM Autostart](#proxmox-reliability-vm-autostart)
+    - [High Availability Nomad Cluster](#high-availability-nomad-cluster)
+    - [Advanced Nomad Job Management](#advanced-nomad-job-management)
+    - [Persistent Storage: Local Volumes & Node Affinity](#persistent-storage-local-volumes--node-affinity)
+    - [Local Image Management: Private Docker Registry](#local-image-management-private-docker-registry)
+16. [Current Cluster Architecture](#current-cluster-architecture)
+17. [Node Setup Checklist](#node-setup-checklist)
 
 ---
 
@@ -863,7 +869,7 @@ bind_addr = "0.0.0.0"
 
 server {
   enabled          = true
-  bootstrap_expect = 1
+  bootstrap_expect = 3  # Updated for HA (was 1)
 }
 
 client {
@@ -875,6 +881,10 @@ plugin "docker" {
     allow_privileged = true
     allow_caps       = ["ALL"]
   }
+}
+
+client {
+  network_interface = "tailscale0"
 }
 
 advertise {
@@ -898,8 +908,9 @@ data_dir  = "/opt/nomad/data"
 bind_addr = "0.0.0.0"
 
 client {
-  enabled = true
-  servers = ["100.NODE_1_IP:4647"]
+  enabled           = true
+  servers           = ["100.NODE_1_IP:4647"]
+  network_interface = "tailscale0"
 }
 
 plugin "docker" {
@@ -1047,6 +1058,217 @@ A successful run prints the full `nvidia-smi` output. The task will show as `dea
 
 ---
 
+## Part 3 — Advanced Configuration & Local Registry
+
+Following the initial cluster deployment, several critical internal optimizations were performed to ensure high availability, data persistence, and a streamlined development-to-deployment workflow.
+
+### Proxmox Reliability: VM Autostart
+
+By default, Proxmox does not automatically start VMs after a host reboot. Following a power outage, the Proxmox hosts will reboot (due to the BIOS "Restore on AC Power Loss" rule), but the Ubuntu VMs will sit idle.
+
+**To enable VM autostart, run the following on each Proxmox host shell:**
+
+```bash
+# Replace 100 with your specific VM ID
+qm set 100 --onboot 1
+
+# Verify the setting
+qm config 100 | grep onboot
+# Expected output: onboot: 1
+```
+
+---
+
+### High Availability Nomad Cluster
+
+The initial setup relied on a single Nomad server (Node 1). If Node 1 went offline, the entire cluster would go leaderless. To fix this, Node 2 and Node 3 were also configured as servers.
+
+**Updated Configuration for Node 2 & Node 3 (`/etc/nomad.d/nomad.hcl`):**
+
+Add the `server` block to the existing configuration:
+
+```hcl
+server {
+  enabled          = true
+  bootstrap_expect = 3
+}
+```
+
+After updating the config, restart Nomad on all nodes:
+```bash
+sudo systemctl restart nomad
+```
+
+Now the cluster can survive the loss of any single node without interruption.
+
+---
+
+### Advanced Nomad Job Management
+
+To make workloads more resilient and aware of hardware limitations, additional stanzas are required in every `.nomad` job file.
+
+#### 1. Restart and Reschedule Policies
+Current Nomad jobs will stay dead if they crash. Adding these blocks ensures Nomad attempts to recover the job locally or move it to a healthy node.
+
+```hcl
+group "your-group" {
+  restart {
+    attempts = 5
+    interval = "5m"
+    delay    = "15s"
+    mode     = "delay"   # keep retrying, don't give up
+  }
+
+  reschedule {
+    delay          = "30s"
+    delay_function = "exponential"
+    max_delay      = "10m"
+    unlimited      = true   # relocate to another node if current node fails
+  }
+
+  task "your-task" { ... }
+}
+```
+
+#### 2. Service Health Checks
+Health checks allow Nomad to determine if your service is actually functional, not just "running."
+
+```hcl
+service {
+  name = "your-service-name"
+
+  check {
+    type     = "script"
+    command  = "/bin/sh"
+    args     = ["-c", "pgrep -f your_process_name || exit 2"]
+    interval = "30s"
+    timeout  = "5s"
+  }
+}
+# For HTTP services, use type = "http" with a /health endpoint.
+```
+
+#### 3. Hardware Constraints (Node 2 Support)
+The GTX 1060 in Node 2 only has 3GB of VRAM, which is insufficient for most modern AI inference. To prevent Large Language Models (LLMs) from landing on Node 2 and failing silently, add a memory constraint:
+
+```hcl
+resources {
+  device "nvidia/gpu" {
+    count = 1
+    constraint {
+      attribute = "${device.attr.memory}"
+      operator  = ">="
+      value     = "4 GiB"
+    }
+  }
+}
+```
+This forces GPU jobs to utilize only the RTX 3050 (Node 1) or RTX 3080 (Node 3).
+
+---
+
+### Persistent Storage: Local Volumes & Node Affinity
+
+Data stored inside a container is volatile. For AI models or databases (like Apollo-AI), persistent storage is required.
+
+#### Step 1: Prepare the Host Nodes
+Create the volume directory on **all three nodes** to ensure Nomad can place the task anywhere.
+
+```bash
+sudo mkdir -p /opt/nomad/volumes/apollo
+sudo chmod -R 777 /opt/nomad/volumes/apollo
+```
+
+#### Step 2: Configure the Job File
+Define the volume in the task block:
+
+```hcl
+task "apollo-task" {
+  driver = "docker"
+  config {
+    image = "..."
+    volumes = [
+      "/opt/nomad/volumes/apollo:/app/data" # host_path : container_path
+    ]
+  }
+}
+```
+
+> [!IMPORTANT]
+> **Data Locality Catch:** Local volumes do not move between nodes. If a job moves from Node 2 to Node 3, it will see an empty folder on Node 3.
+> **Solution:** Use hard `constraints` in the job file to pin the task to the specific node where the data resides.
+
+---
+
+### Local Image Management: Private Docker Registry
+
+A private registry allows you to build custom Docker images on your Mac and push them to the cluster without using a public hub.
+
+#### 1. Setup on Node 1 (Registry Host)
+Create storage and deploy the registry service:
+
+```bash
+sudo mkdir -p /opt/registry/data
+sudo chown -R 1000:1000 /opt/registry/data
+```
+
+**registry.nomad:**
+```hcl
+job "registry" {
+  datacenters = ["dc1"]
+  type        = "service"
+
+  group "registry" {
+    constraint {
+      attribute = "${node.unique.id}"
+      value     = "5bcd9b82-365b-aebd-538a-b54c5035967f" # Fixed to gpu-node-1
+    }
+
+    network {
+      port "registry" {
+        static = 5000
+        to     = 5000
+      }
+    }
+
+    task "registry" {
+      driver = "docker"
+      config {
+        image   = "registry:2"
+        ports   = ["registry"]
+        volumes = ["/opt/registry/data:/var/lib/registry"]
+      }
+    }
+  }
+}
+```
+
+#### 2. Configure Clients (Mac & Nodes)
+Since the registry uses HTTP over Tailscale, it must be added to the `insecure-registries` list in Docker settings:
+
+```json
+{
+  "insecure-registries": ["100.NODE1_IP:5000"]
+}
+```
+*On Mac: Docker Desktop → Settings → Docker Engine.*
+*On Nodes: Edit `/etc/docker/daemon.json` and restart Docker.*
+
+#### 3. Development Workflow
+
+```bash
+# On your Mac
+docker build -t 100.NODE1_IP:5000/your-project:latest .
+docker push 100.NODE1_IP:5000/your-project:latest
+
+# Reference in your .nomad file
+config {
+  image = "100.NODE1_IP:5000/your-project:latest"
+}
+```
+
+---
+
 ## My Current Cluster Architecture
 
 All three nodes are fully operational, remotely accessible via Tailscale, and running identical Ubuntu 22.04 VM environments with Docker, CUDA, and the NVIDIA Container Toolkit pre-installed.
@@ -1054,8 +1276,8 @@ All three nodes are fully operational, remotely accessible via Tailscale, and ru
 | Node | Hardware | Proxmox Hostname | GPU | Role |
 |---|---|---|---|---|
 | Node 1 | ASUS Laptop | `pve` | RTX 3050 Mobile | UI, FastAPI Orchestrator, Nomad Server + Client, Quorum Vote |
-| Node 2 | Desktop PC | `pve-node2` | GTX 1060 3GB | Model Inference, Dev Environment, Nomad Client |
-| Node 3 | Desktop PC | `pve-node3` | RTX 3080 | Heavy Training Engine, Batch Processing, Nomad Client |
+| Node 2 | Desktop PC | `pve-node2` | GTX 1060 3GB | Model Inference, Dev Environment, Nomad Server + Client |
+| Node 3 | Desktop PC | `pve-node3` | RTX 3080 | Heavy Training Engine, Batch Processing, Nomad Server + Client |
 
 **Operational status:**
 
@@ -1065,7 +1287,8 @@ All three nodes are fully operational, remotely accessible via Tailscale, and ru
 | Cluster orchestration | All 3 nodes joined to `home-cluster` — single-pane-of-glass Proxmox dashboard |
 | VM environment | Identical Ubuntu 22.04 VMs cloned from master template on all nodes |
 | GPU workloads | Docker + NVIDIA Container Runtime operational on all 3 nodes |
-| Job scheduling | Nomad cluster live with GPU-aware scheduling via NVIDIA device plugin |
+| Job scheduling | Nomad cluster live with **High Availability (3 servers)** and GPU-aware scheduling |
+| Image Registry | Private Docker Registry active on Node 1 |
 
 ---
 
@@ -1083,7 +1306,9 @@ A condensed reference for setting up any additional node from scratch.
 # 4. Install Tailscale
 curl -fsSL https://tailscale.com/install.sh | sh
 tailscale up
-# 5. Verify remote access: https://100.x.x.x:8006
+# 5. Enable VM Autostart
+qm set <VMID> --onboot 1
+# 6. Verify remote access: https://100.x.x.x:8006
 ```
 
 ### Enable GPU Passthrough
@@ -1115,11 +1340,24 @@ update-initramfs -u -k all && reboot
 # 11. On Node 1: Clone the master template (Full Clone, target = Node 1)
 # 12. Remove hostpci entries from the cloned VM config
 # 13. Migrate the cloned VM to the target node
-# 14. On the target node: re-add GPU hostpci entries
+# 14/15. On the target node: re-add GPU hostpci entries
 nano /etc/pve/qemu-server/<VMID>.conf
 # hostpci0: 0000:01:00.0,pcie=1
 # hostpci1: 0000:01:00.1,pcie=1
-# 15. Start VM, update hostname inside guest OS
+
+# 16. Configure Nomad Client (Tailscale Interface)
+# Edit /etc/nomad.d/nomad.hcl:
+# client { network_interface = "tailscale0" }
+
+# 17. Configure Nomad Server (for HA)
+# Add to /etc/nomad.d/nomad.hcl:
+# server { enabled = true, bootstrap_expect = 3 }
+
+# 18. Configure Docker (Insecure Registry)
+# Edit /etc/docker/daemon.json:
+# { "insecure-registries": ["100.NODE1_IP:5000"] }
+
+# 19. Start VM, update hostname inside guest OS
 ```
 
 ### GPU Driver Verification
