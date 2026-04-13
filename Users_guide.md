@@ -1,8 +1,6 @@
-# Users Guide — Deploying a Project to the Home Cloud
+# Users Guide: Deploying a Project to the Home Cloud
 
 How to take a project that works on your laptop and get it running on the home cloud cluster.
-
----
 
 ## Prerequisites
 
@@ -14,8 +12,6 @@ How to take a project that works on your laptop and get it running on the home c
   export NOMAD_ADDR="http://100.NODE1_IP:4646"
   ```
 - The private registry (`100.NODE1_IP:5000`) is listed in Docker Desktop's **insecure-registries** (Settings → Docker Engine)
-
----
 
 ## Step 1: Containerize Your Project
 
@@ -54,8 +50,6 @@ docker build -t my-project .
 docker run my-project
 ```
 
----
-
 ## Step 2: Push to the Private Registry
 
 Build and tag the image for the cluster's private registry, then push:
@@ -66,8 +60,6 @@ docker push 100.NODE1_IP:5000/my-project:latest
 ```
 
 The image is now available to all nodes in the cluster.
-
----
 
 ## Step 3: Write a Nomad Job File
 
@@ -181,15 +173,11 @@ If your project needs data to survive restarts (databases, model weights, etc.):
    ```
    Find node IDs with: `nomad node status`
 
----
-
 ## Step 4: Deploy
 
 ```bash
 nomad job run my-project.nomad
 ```
-
----
 
 ## Step 5: Verify & Monitor
 
@@ -206,8 +194,6 @@ nomad alloc logs -f <alloc-id>
 
 Access your service at `http://100.NODE_IP:8080` (the Tailscale IP of whichever node Nomad placed it on — shown in the job status output).
 
----
-
 ## Updating a Deployment
 
 When you make changes to your project:
@@ -223,15 +209,11 @@ nomad job run my-project.nomad
 
 Nomad will pull the updated image and restart the task.
 
----
-
 ## Stopping a Deployment
 
 ```bash
 nomad job stop my-project
 ```
-
----
 
 ## Quick Reference
 
@@ -245,8 +227,6 @@ nomad job stop my-project
 | List all jobs | `nomad job status` |
 | List nodes | `nomad node status` |
 
----
-
 ## Job Types
 
 | Type | Use Case | Behavior |
@@ -254,9 +234,7 @@ nomad job stop my-project
 | `service` | Web servers, APIs, inference endpoints | Stays running. Nomad restarts it if it crashes. |
 | `batch` | One-off scripts, training runs, data processing | Runs once and exits. `dead` with exit code 0 = success. |
 
----
-
-## Cluster Details
+## My Cluster Details:
 
 | Node | GPU | Best For |
 |---|---|---|
