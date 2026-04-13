@@ -23,3 +23,9 @@ The system successfully hosts public-facing web infrastructure on the home clust
 - [x] Configured Cloudflare DNS and Zero Trust networking.
 - [x] Deployed a `cloudflared` connector inside the Proxmox VM.
 - [x] Verified routing infrastructure by successfully deploying and exposing the containerized "Fire" ML application.
+
+## Troubleshooting / Known Issues
+
+### Local DNS Not Resolving After Cloudflare Tunnel Creation
+When initially routing a new domain or subdomain through a Cloudflare Tunnel, your Mac/laptop (unlike a mobile phone on cellular data) may aggressively cache the old DNS records or fail to resolve the new route locally while connected to Tailscale.
+- **The Fix:** Simply turn off Tailscale on your local machine, refresh the browser to load the site via the public internet directly, and then turn Tailscale back on. This forces the local DNS/network stack to acknowledge the new Cloudflare route.
